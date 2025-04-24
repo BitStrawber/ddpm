@@ -22,15 +22,16 @@ from einops.layers.torch import Rearrange
 
 from scipy.optimize import linear_sum_assignment
 
+
 from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
 from accelerate import Accelerator
 
-from denoising_diffusion_pytorch.attend import Attend
+from attend import Attend
 
-from denoising_diffusion_pytorch.version import __version__
+from version import __version__
 
 # constants
 
@@ -845,18 +846,25 @@ class GaussianDiffusion(Module):
 class Dataset(Dataset):
     def __init__(
         self,
-        folder,
+        folder1,
+        folder2,
         image_size,
         exts = ['jpg', 'jpeg', 'png', 'tiff'],
         augment_horizontal_flip = False,
-        convert_image_to = None
+        convert_image_to = None,
+        fusion_method = 'average'
     ):
         super().__init__()
-        self.folder = folder
+        self.folder1 = folder1
+        self.folder2 = folder2
         self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-
+        self.folder1_paths = [p for ext in exts for p in Path(f'{folder1}').glob(f'**/*.{ext}')]
+        self.folder2_paths = [p for ext in exts for p in Path(f'{folder2}').glob(f'**/*.{ext}')]
         maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
+        self.fusion_method = fusion_method
+
+        # 确定两个文件夹中图像数量较少的那个文件夹
+        self.min_length = min(len(self.folder1_paths), len(self.folder2_paths))
 
         self.transform = T.Compose([
             T.Lambda(maybe_convert_fn),
@@ -867,12 +875,24 @@ class Dataset(Dataset):
         ])
 
     def __len__(self):
-        return len(self.paths)
+        return self.min_length
 
     def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        # 随机选择两类图像各一张
+        class1_path = self.folder1_paths[index]
+        class2_path = self.folder2_paths[index]
+
+        # 加载图像
+        img1 = Image.open(class1_path)
+        img2 = Image.open(class2_path)
+
+        # 应用转换
+        img1 = self.transform(img1)
+        img2 = self.transform(img2)
+
+        data = (img1 + img2)/2
+
+        return data
 
 # trainer class
 
@@ -880,7 +900,8 @@ class Trainer:
     def __init__(
         self,
         diffusion_model,
-        folder,
+        folder1,
+        folder2,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -940,7 +961,7 @@ class Trainer:
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = Dataset(folder1, folder2, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
@@ -975,7 +996,7 @@ class Trainer:
         self.calculate_fid = calculate_fid and self.accelerator.is_main_process
 
         if self.calculate_fid:
-            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
+            from fid_evaluation import FIDEvaluation
 
             if not is_ddim_sampling:
                 self.accelerator.print(
